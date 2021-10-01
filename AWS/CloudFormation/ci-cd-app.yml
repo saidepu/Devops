@@ -1,0 +1,743 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Creates Jenkins and SonarQube on ECS service (and ELB to
+  view externally)
+Parameters:
+  Project: 
+    Type: String
+    AllowedPattern : .+
+  Env:
+    Type: String
+    Default: dev
+  Service: 
+    Type: String
+    Default: cicd
+  VPCStackName: 
+    Type: String
+    AllowedPattern : .+
+  DatabaseStackName: 
+    Type: String
+    AllowedPattern : .+
+  InfraStackName: 
+    Type: String
+    AllowedPattern: .+
+  DNSDomain: 
+    Type: String
+  HostedZoneName: 
+    Type: String
+  LoadBalancerScheme:
+    Description: 'Indicates whether the load balancer in front of the ECS cluster is internet-facing or internal.'
+    Type: String
+    Default: internal
+    AllowedValues:
+    - internet-facing
+    - internal
+  JenkinsHttpsCertificateArn: 
+    Type: String
+  SonarHttpsCertificateArn: 
+    Type: String
+  JenkinsImageURL: 
+    Type: String
+    Default: 160699259667.dkr.ecr.eu-west-1.amazonaws.com/cloud-studio/jenkins:1.0.3
+  SonarImageURL: 
+    Type: String
+    Default: 160699259667.dkr.ecr.eu-west-1.amazonaws.com/cloud-studio/sonarqube:1.0.1
+  AnchoreImageURL: 
+    Type: String
+    Default: anchore/anchore-engine:v0.4.0
+  InstallSonarqube:
+    Description: 'it Specifies if sonarqube must be installed'
+    Type: String
+    Default: true
+    AllowedValues: [true, false]
+  InstallAnchore:
+    Description: 'it Specifies if anchore must be installed'
+    Type: String
+    Default: true
+    AllowedValues: [true, false]
+  DatabaseStackName:
+    Type: String
+    Default: ''
+Metadata: 
+  AWS::CloudFormation::Interface: 
+    ParameterGroups: 
+      - 
+        Label: 
+          default: "Main Configuration"
+        Parameters: 
+          - Project
+          - Env
+          - Service
+          - InfraStackName
+          - DatabaseStackName
+      - 
+        Label: 
+          default: "Jenkins Configuration"
+        Parameters: 
+          - JenkinsImageURL
+      - 
+        Label: 
+          default: "Sonarqube Configuration"
+        Parameters:
+          - InstallSonarqube 
+          - SonarImageURL
+      - 
+        Label: 
+          default: "Anchore Configuration"
+        Parameters:
+          - InstallAnchore 
+          - AnchoreImageURL
+      - 
+        Label: 
+          default: "Network Configuration"
+        Parameters: 
+          - VPCStackName
+          - LoadBalancerScheme
+          - DNSDomain
+          - HostedZoneName
+          - JenkinsHttpsCertificateArn
+          - SonarHttpsCertificateArn
+        
+    ParameterLabels: 
+      InstallSonarqube: 
+        default: "Install Sonarqube"
+      InstallAnchore: 
+        default: "Install Anchore"
+Rules:
+  checkDNSDomain:
+    RuleCondition: 
+      Fn::Not:
+        - Fn::Equals: 
+          - !Ref DNSDomain
+          - ''
+    Assertions:
+      - Assert:
+          Fn::Not:
+             - Fn::Equals:
+               - !Ref HostedZoneName
+               - ''
+        AssertDescription: 'HostedZoneName is required if DNSDomain is not null'
+  checkDatabase:
+    RuleCondition: 
+      Fn::Or:
+        - Fn::Equals: 
+          - !Ref InstallSonarqube
+          - 'true'
+        - Fn::Equals: 
+          - !Ref InstallAnchore
+          - 'true'
+    Assertions:
+      - Assert:
+          Fn::Not:
+             - Fn::Equals:
+               - !Ref DatabaseStackName
+               - ''
+        AssertDescription: 'DatabaseStackName is required if InstallSonarqube or InstallAnchore are true'
+Conditions:
+  HasLoadBalancerSchemeInternal: !Equals [!Ref LoadBalancerScheme, 'internal']
+  HasDNSDomain: !Not [!Equals [!Ref DNSDomain, '']]
+  HasHostedZoneName: !Not [!Equals [!Ref HostedZoneName, '']]
+  HasJenkinsHTTPSCertificate: !Not [!Equals [!Ref JenkinsHttpsCertificateArn, '']]
+  HasSonarHTTPSCertificate: !Not [!Equals [!Ref SonarHttpsCertificateArn, '']]
+  InstallSonarqubeFlag: !Equals [!Ref InstallSonarqube, 'true']
+  InstallAnchoreFlag: !Equals [!Ref InstallAnchore, 'true']
+  HasSonarDNSRecord: !And [!Condition HasDNSDomain, !Condition InstallAnchoreFlag]
+  HasSonarqubeOrAnchore: !Or [!Condition InstallSonarqubeFlag, !Condition InstallAnchoreFlag]
+Resources:
+  JenkinsDNSRecord:
+    Type: AWS::Route53::RecordSetGroup
+    Condition: HasDNSDomain
+    Properties:
+      Comment: DNS name for my jenkins.
+      HostedZoneName: !Ref HostedZoneName
+      RecordSets:
+      - Name: !Join ['', ['jenkins.', !Ref DNSDomain]]
+        Type: A
+        AliasTarget:
+          HostedZoneId: !GetAtt JenkinsLoadBalancer.CanonicalHostedZoneNameID
+          DNSName: !GetAtt JenkinsLoadBalancer.DNSName
+  SonarDNSRecord:
+    Type: AWS::Route53::RecordSetGroup
+    Condition: HasSonarDNSRecord
+    Properties:
+      Comment: DNS name for my sonar.
+      HostedZoneName: !Ref HostedZoneName
+      RecordSets:
+      - Name: !Join ['', ['sonar.', !Ref DNSDomain]]
+        Type: A
+        AliasTarget:
+          HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+          DNSName: !GetAtt LoadBalancer.DNSName
+  JenkinsLoadBalancer:
+    Properties:
+      Subnets: !If
+      - HasLoadBalancerSchemeInternal
+      - !Split [',', {'Fn::ImportValue': !Sub '${VPCStackName}-PrivateSubnets'}]
+      - !Split [',', {'Fn::ImportValue': !Sub '${VPCStackName}-PublicSubnets'}]
+      Scheme: !Ref LoadBalancerScheme
+      SecurityGroups:
+        - {'Fn::ImportValue': !Sub '${InfraStackName}-ECSClusterSecurityGroup'}
+        - !Ref JenkinsElbSecurityGroup
+      Listeners:
+        - InstancePort: '8080'
+          InstanceProtocol: HTTP
+          LoadBalancerPort: !If
+          - HasJenkinsHTTPSCertificate
+          - 443
+          - 80
+          Protocol: !If
+          - HasJenkinsHTTPSCertificate
+          - HTTPS
+          - HTTP
+          SSLCertificateId: !If
+          - HasJenkinsHTTPSCertificate
+          - !Ref JenkinsHttpsCertificateArn
+          - AWS::NoValue
+        - InstancePort: '50000'
+          InstanceProtocol: TCP
+          LoadBalancerPort: '50000'
+          Protocol: TCP
+      HealthCheck:
+        HealthyThreshold: '2'
+        Interval: '30'
+        Target: 'HTTP:8080/login'
+        Timeout: '15'
+        UnhealthyThreshold: '5'
+    Type: 'AWS::ElasticLoadBalancing::LoadBalancer'
+  JenkinsElbSecurityGroup:
+    Properties:
+      VpcId: {'Fn::ImportValue': !Sub '${VPCStackName}-VPCID'}
+      GroupDescription: Jenkins ELB security group
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !If
+          - HasJenkinsHTTPSCertificate
+          - '443'
+          - '80'
+          ToPort: !If
+          - HasJenkinsHTTPSCertificate
+          - '443'
+          - '80'
+          CidrIp: !If
+          - HasLoadBalancerSchemeInternal
+          - {'Fn::ImportValue': !Sub '${VPCStackName}-VpcCidrBlock'}
+          - 0.0.0.0/0 
+    Type: 'AWS::EC2::SecurityGroup'
+  
+  LoadBalancer: # not monitored, but DefaultTargetGroup is monitored!
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Condition: HasSonarqubeOrAnchore
+    Properties:
+#      Name: !Sub "${Project}-${Version}-${EnvName}-ALB"
+      Type: network
+      Scheme: !Ref LoadBalancerScheme
+      Subnets: !If
+      - HasLoadBalancerSchemeInternal
+      - !Split [',', {'Fn::ImportValue': !Sub '${VPCStackName}-PrivateSubnets'}]
+      - !Split [',', {'Fn::ImportValue': !Sub '${VPCStackName}-PublicSubnets'}]
+
+  DefaultTargetGroup: # this is used as the fall-back target group and is used to health checking the ECS agent. Services use their own ListenerRules to accept traffic based on path prefixes.
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    Condition: HasSonarqubeOrAnchore
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPort: '51678'
+      HealthCheckPath: '/'
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200-299'
+      Port: 80 # port 80 is a reserved port that is never used by the agent, so we are safe to use it here
+      Protocol: HTTP
+      VpcId: {'Fn::ImportValue': !Sub '${VPCStackName}-VPCID'}
+      TargetGroupAttributes:
+      - Key: 'deregistration_delay.timeout_seconds'
+        Value: '0'
+  TaskSecurityGroup:
+    Condition: HasSonarqubeOrAnchore
+    Properties:
+      VpcId: {'Fn::ImportValue': !Sub '${VPCStackName}-VPCID'}
+      GroupDescription: Tasks security group
+      SecurityGroupIngress:
+        - IpProtocol: '-1'
+          FromPort: '-1'
+          ToPort: '-1'
+          CidrIp: {'Fn::ImportValue': !Sub '${VPCStackName}-VpcCidrBlock'}
+    Type: 'AWS::EC2::SecurityGroup'
+  SonarSecurityGroup:
+    Condition: InstallSonarqubeFlag
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref TaskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 9000
+      ToPort: 9000
+      CidrIp: '0.0.0.0/0'
+  
+  ECSTaskRole:
+    Condition: HasSonarqubeOrAnchore
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs.amazonaws.com
+                - ecs-tasks.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: AmazonEC2ContainerServiceRole
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                    # Allow the ECS Tasks to download images from ECR
+                  - 'ecr:GetAuthorizationToken'
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:BatchGetImage'
+                   # Allow the ECS tasks to upload logs to CloudWatch
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:CreateLogGroup'
+                  - 'logs:DescribeLogStreams'
+                Resource: '*'
+    Type: 'AWS::IAM::Role'
+  
+  ### JENKINS SERVICE ###
+  
+  JenkinsECSService:
+    Properties:
+      Cluster: {'Fn::ImportValue': !Sub '${InfraStackName}-ClusterName'}
+      DesiredCount: 1
+      PlacementStrategies:
+        - Type: spread
+          Field: host
+      LoadBalancers:
+        - ContainerName: jenkins
+          ContainerPort: '8080'
+          LoadBalancerName: !Ref JenkinsLoadBalancer
+      Role: {'Fn::ImportValue': !Sub '${InfraStackName}-ECSServiceRole'}
+      TaskDefinition: !Ref JenkinsTaskDefinition
+    Type: 'AWS::ECS::Service'
+  JenkinsTaskDefinition:
+    Properties:
+      Family: !Sub '${AWS::StackName}-jenkins'
+      ContainerDefinitions:
+        - Name: jenkins
+          Image: !Ref JenkinsImageURL
+          Cpu: 16
+          Memory: 4096
+          MemoryReservation: 1024
+          Environment:
+            - Name: JAVA_OPTS
+              Value: "-Djenkins.install.runSetupWizard=false -Dpermissive-script-security.enabled=true -Dhudson.model.DirectoryBrowserSupport.CSP=\"sandbox allow-same-origin allow-scripts; default-src 'self'; script-src * 'unsafe-eval'; img-src *; style-src * 'unsafe-inline'; font-src *\" -Dpermissive-script-security.enabled=true"
+            - Name: JENKINS_PLUGINS
+              Value: 'blueocean aws-credentials aws-java-sdk git kubernetes-cd kubernetes-cli pipeline-utility-steps nodejs pipeline-aws workflow-aggregator sonar locale dependency-check-jenkins-plugin performance timestamper htmlpublisher workflow-multibranch dependency-check-jenkins-plugin amazon-ecr docker-plugin parameter-separator scalable-amazon-ecs uno-choice basic-branch-build-strategies permissive-script-security anchore-container-scanner http_request'    
+          Essential: true
+          MountPoints:
+            - ContainerPath: /var/jenkins_home
+              SourceVolume: efs-jenkins
+            - ContainerPath: /var/run/docker.sock
+              SourceVolume: docker-sock
+          PortMappings:
+            - HostPort: 8080
+              ContainerPort: 8080
+            - HostPort: 50000
+              ContainerPort: 50000
+      Volumes:
+        - Name: efs-jenkins
+          Host:
+            SourcePath: /mnt/efs/jenkins_home
+        - Name: docker-sock
+          Host:
+            SourcePath: /var/run/docker.sock
+    Type: 'AWS::ECS::TaskDefinition'
+  
+   ### SONARQUBE SERVICE ###
+
+  SonarListener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Condition: InstallSonarqubeFlag
+    Properties:
+      DefaultActions:
+      - TargetGroupArn: !Ref SonarLoadBalancerTargetGroup
+        Type: forward
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: !If
+        - HasSonarHTTPSCertificate
+        - 443
+        - 9000
+      Certificates: !If
+        - HasSonarHTTPSCertificate
+        - [CertificateArn: !Ref SonarHttpsCertificateArn]
+        - !Ref AWS::NoValue
+      Protocol:  !If
+          - HasSonarHTTPSCertificate
+          - TLS
+          - TCP
+
+  SonarLoadBalancerTargetGroup:
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    Condition: InstallSonarqubeFlag
+    Properties:
+      TargetType: ip
+      HealthCheckIntervalSeconds: 30
+      HealthCheckProtocol: TCP
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 5
+      Port: 9000
+      Protocol: TCP
+      VpcId: {'Fn::ImportValue': !Sub '${VPCStackName}-VPCID'}
+      TargetGroupAttributes:
+      - Key: deregistration_delay.timeout_seconds
+        Value: 60
+
+  SonarECSService:
+    Condition: InstallSonarqubeFlag
+    DependsOn: 
+    - SonarListener
+    Properties:
+      Cluster: {'Fn::ImportValue': !Sub '${InfraStackName}-ClusterName'}
+      DesiredCount: 1
+      HealthCheckGracePeriodSeconds : 90
+      PlacementStrategies:
+        - Type: spread
+          Field: host
+      LoadBalancers:
+        - ContainerName: sonarqube
+          ContainerPort: '9000'
+          TargetGroupArn: !Ref SonarLoadBalancerTargetGroup
+      #Role: {'Fn::ImportValue': !Sub '${InfraStackName}-ECSServiceRole'}
+      TaskDefinition: !Ref SonarTaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref TaskSecurityGroup
+          Subnets: { "Fn::Split" : [ ",", {'Fn::ImportValue': !Sub '${VPCStackName}-PrivateSubnets'} ] }
+    Type: 'AWS::ECS::Service'
+  SonarTaskDefinition:
+    Condition: InstallSonarqubeFlag
+    Properties:
+      Family: !Sub '${AWS::StackName}-sonarqube'
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !Ref ECSTaskRole
+      ContainerDefinitions:
+        - Name: sonarqube
+          Image: !Ref SonarImageURL
+          Cpu: 16
+          Memory: 4096
+          MemoryReservation: 1024
+          Essential: true
+          Environment:
+            - Name: sonar.jdbc.username
+              Value: {'Fn::ImportValue': !Sub '${DatabaseStackName}-DatabaseUsername'}
+            - Name: sonar.jdbc.password
+              Value: {'Fn::ImportValue': !Sub '${DatabaseStackName}-DatabasePassword'}
+            - Name: sonar.jdbc.url
+              Value: !Join 
+                - ''
+                - - 'jdbc:postgresql://'
+                  - {'Fn::ImportValue': !Sub '${DatabaseStackName}-DNSName'}
+                  - ':'
+                  - {'Fn::ImportValue': !Sub '${DatabaseStackName}-DatabasePort'}
+                  - '/sonar2'
+            - Name: sonar.log.level
+              Value: INFO
+          MountPoints:
+            - ContainerPath: /opt/sonarqube/conf
+              SourceVolume: sonar-conf
+            - ContainerPath: /opt/sonarqube/data
+              SourceVolume: sonar-data
+            - ContainerPath: /opt/sonarqube/extensions
+              SourceVolume: sonar-extensions
+          PortMappings:
+            - HostPort: 9000
+              ContainerPort: 9000
+      Volumes:
+        - Name: sonar-conf
+          Host:
+            SourcePath: /mnt/efs/sonar_home/conf
+        - Name: sonar-data
+          Host:
+            SourcePath: /mnt/efs/sonar_home/data
+        - Name: sonar-extensions
+          Host:
+            SourcePath: /mnt/efs/sonar_home/extensions
+    Type: 'AWS::ECS::TaskDefinition'
+
+
+# ANCHORE SERVICE 1
+
+  AnchoreListener1:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Condition: InstallAnchoreFlag
+    Properties:
+      DefaultActions:
+      - TargetGroupArn: !Ref AnchoreLoadBalancerTargetGroup1
+        Type: forward
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 8228
+      Protocol: TCP
+
+  AnchoreLoadBalancerTargetGroup1:
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    Condition: InstallAnchoreFlag
+    Properties:
+      TargetType: ip
+      HealthCheckIntervalSeconds: 30
+      HealthCheckProtocol: TCP
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 5
+      Port: 8228
+      Protocol: TCP
+      VpcId: {'Fn::ImportValue': !Sub '${VPCStackName}-VPCID'}
+      TargetGroupAttributes:
+      - Key: deregistration_delay.timeout_seconds
+        Value: 60
+
+  AnchoreService1:
+    Type: 'AWS::ECS::Service'
+    Condition: InstallAnchoreFlag
+    DependsOn: 
+    - AnchoreListener1
+    - JenkinsECSService
+    Properties:
+      Cluster: {'Fn::ImportValue': !Sub '${InfraStackName}-ClusterName'}
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+      DesiredCount: 1
+      HealthCheckGracePeriodSeconds: 90
+      LoadBalancers:
+      - ContainerName: engine-api
+        ContainerPort: 8228
+        TargetGroupArn: !Ref AnchoreLoadBalancerTargetGroup1
+      PlacementStrategies:
+      - Type: binpack
+        Field: memory
+      #Role: {'Fn::ImportValue': !Sub '${InfraStackName}-ECSServiceRole'}
+      TaskDefinition: !Ref AnchoreTaskDefinition1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref TaskSecurityGroup
+          Subnets: { "Fn::Split" : [ ",", {'Fn::ImportValue': !Sub '${VPCStackName}-PrivateSubnets'} ] }
+  
+  AnchoreTaskDefinition1:
+    Type: 'AWS::ECS::TaskDefinition'
+    Condition: InstallAnchoreFlag
+    Properties:
+      Family: !Sub '${AWS::StackName}-anchore'
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !Ref ECSTaskRole
+      Volumes:
+        - Name: anchore-scratch
+      ContainerDefinitions:
+      - Name: engine-api
+        Image: !Ref AnchoreImageURL
+        Cpu: 16
+        Memory: 1024
+        MemoryReservation: 256
+        Command: ["anchore-manager", "service", "start", "apiext"]
+        HealthCheck:    
+          Command: [ "CMD-SHELL", "curl -f http://localhost:8228/health || exit 1" ]
+          Interval: 60
+          Retries: 5
+          StartPeriod: 60
+          Timeout: 30
+        PortMappings:
+          - HostPort: 8228
+            ContainerPort: 8228
+            Protocol: tcp
+        Environment:
+          - Name: ANCHORE_ENDPOINT_HOSTNAME
+            Value: '127.0.0.1'
+          - Name: ANCHORE_DB_HOST
+            Value: {'Fn::ImportValue': !Sub '${DatabaseStackName}-DNSName'}
+          - Name: ANCHORE_DB_PORT
+            Value: {'Fn::ImportValue': !Sub '${DatabaseStackName}-DatabasePort'}
+          - Name: ANCHORE_DB_USER
+            Value: {'Fn::ImportValue': !Sub '${DatabaseStackName}-DatabaseUsername'}
+          - Name: ANCHORE_DB_PASSWORD
+            Value: {'Fn::ImportValue': !Sub '${DatabaseStackName}-DatabasePassword'}
+          - Name: ANCHORE_FEEDS_SELECTIVE_ENABLED
+            Value: false
+         # - Name: ANCHORE_ADMIN_PASSWORD
+         #   Value: 'admin123!'
+          
+        Essential: true
+      - Name: engine-catalog
+        Image: !Ref AnchoreImageURL
+        Cpu: 16
+        Memory: 1024
+        MemoryReservation: 256
+        Command: ["anchore-manager", "service", "start", "catalog"]
+        HealthCheck:    
+          Command: [ "CMD-SHELL", "curl -f http://localhost:8228/health || exit 1" ]
+          Interval: 60
+          Retries: 5
+          StartPeriod: 60
+          Timeout: 30
+        PortMappings:
+          - ContainerPort: 8229
+            HostPort: 8229
+            Protocol: tcp
+        Environment:
+          - Name: ANCHORE_ENDPOINT_HOSTNAME
+            Value: '127.0.0.1'
+          - Name: ANCHORE_DB_HOST
+            Value: {'Fn::ImportValue': !Sub '${DatabaseStackName}-DNSName'}
+          - Name: ANCHORE_DB_PORT
+            Value: {'Fn::ImportValue': !Sub '${DatabaseStackName}-DatabasePort'}
+          - Name: ANCHORE_DB_USER
+            Value: {'Fn::ImportValue': !Sub '${DatabaseStackName}-DatabaseUsername'}
+          - Name: ANCHORE_DB_PASSWORD
+            Value: {'Fn::ImportValue': !Sub '${DatabaseStackName}-DatabasePassword'}
+          - Name: ANCHORE_FEEDS_SELECTIVE_ENABLED
+            Value: false
+          - Name: ANCHORE_EXTERNAL_PORT
+            Value: 8229
+          - Name: ANCHORE_SERVICE_PORT
+            Value: 8229
+          # - Name: ANCHORE_ADMIN_PASSWORD
+          #   Value: 'admin123!'
+         
+        Essential: true
+      - Name: engine-simpleq
+        Image: !Ref AnchoreImageURL
+        Cpu: 16
+        Memory: 1024
+        MemoryReservation: 256
+        Command: ["anchore-manager", "service", "start", "simplequeue"]
+        HealthCheck:    
+          Command: [ "CMD-SHELL", "curl -f http://localhost:8228/health || exit 1" ]
+          Interval: 60
+          Retries: 5
+          StartPeriod: 60
+          Timeout: 30
+        PortMappings:
+          - ContainerPort: 8230
+            HostPort: 8230
+            Protocol: tcp
+        Environment:
+          - Name: ANCHORE_ENDPOINT_HOSTNAME
+            Value: '127.0.0.1'
+          - Name: ANCHORE_DB_HOST
+            Value: {'Fn::ImportValue': !Sub '${DatabaseStackName}-DNSName'}
+          - Name: ANCHORE_DB_PORT
+            Value: {'Fn::ImportValue': !Sub '${DatabaseStackName}-DatabasePort'}
+          - Name: ANCHORE_DB_USER
+            Value: {'Fn::ImportValue': !Sub '${DatabaseStackName}-DatabaseUsername'}
+          - Name: ANCHORE_DB_PASSWORD
+            Value: {'Fn::ImportValue': !Sub '${DatabaseStackName}-DatabasePassword'}
+          - Name: ANCHORE_FEEDS_SELECTIVE_ENABLED
+            Value: false
+          - Name: ANCHORE_EXTERNAL_PORT
+            Value: 8230
+          - Name: ANCHORE_SERVICE_PORT
+            Value: 8230
+        # - Name: ANCHORE_ADMIN_PASSWORD
+        #   Value: 'admin123!'
+        Essential: true
+      - Name: engine-policy-engine
+        Image: !Ref AnchoreImageURL
+        Cpu: 16
+        MemoryReservation: 1024
+        Command: ["anchore-manager", "service", "start", "policy_engine"]
+        HealthCheck:    
+          Command: [ "CMD-SHELL", "curl -f http://localhost:8228/health || exit 1" ]
+          Interval: 60
+          Retries: 5
+          StartPeriod: 60
+          Timeout: 30
+        PortMappings:
+          - ContainerPort: 8231
+            HostPort: 8231
+            Protocol: tcp
+        Environment:
+          - Name: ANCHORE_ENDPOINT_HOSTNAME
+            Value: '127.0.0.1'
+          - Name: ANCHORE_DB_HOST
+            Value: {'Fn::ImportValue': !Sub '${DatabaseStackName}-DNSName'}
+          - Name: ANCHORE_DB_PORT
+            Value: {'Fn::ImportValue': !Sub '${DatabaseStackName}-DatabasePort'}
+          - Name: ANCHORE_DB_USER
+            Value: {'Fn::ImportValue': !Sub '${DatabaseStackName}-DatabaseUsername'}
+          - Name: ANCHORE_DB_PASSWORD
+            Value: {'Fn::ImportValue': !Sub '${DatabaseStackName}-DatabasePassword'}
+          - Name: ANCHORE_FEEDS_SELECTIVE_ENABLED
+            Value: false
+          - Name: ANCHORE_EXTERNAL_PORT
+            Value: 8231
+          - Name: ANCHORE_SERVICE_PORT
+            Value: 8231
+        # - Name: ANCHORE_ADMIN_PASSWORD
+        #   Value: 'admin123!'
+        Essential: true
+      - Name: engine-analyzer
+        Image: !Ref AnchoreImageURL
+        Cpu: 16
+        Memory: 2048
+        MemoryReservation: 256
+        Command: ["anchore-manager", "service", "start", "analyzer"]
+        HealthCheck:    
+          Command: [ "CMD-SHELL", "curl -f http://localhost:8228/health || exit 1" ]
+          Interval: 60
+          Retries: 5
+          StartPeriod: 60
+          Timeout: 30
+        PortMappings:
+          - ContainerPort: 8232
+            HostPort: 8232
+            Protocol: tcp
+        Environment:
+          - Name: ANCHORE_ENDPOINT_HOSTNAME
+            Value: '127.0.0.1'
+          - Name: ANCHORE_DB_HOST
+            Value: {'Fn::ImportValue': !Sub '${DatabaseStackName}-DNSName'}
+          - Name: ANCHORE_DB_PORT
+            Value: {'Fn::ImportValue': !Sub '${DatabaseStackName}-DatabasePort'}
+          - Name: ANCHORE_DB_USER
+            Value: {'Fn::ImportValue': !Sub '${DatabaseStackName}-DatabaseUsername'}
+          - Name: ANCHORE_DB_PASSWORD
+            Value: {'Fn::ImportValue': !Sub '${DatabaseStackName}-DatabasePassword'}
+          - Name: ANCHORE_FEEDS_SELECTIVE_ENABLED
+            Value: false
+          - Name: ANCHORE_EXTERNAL_PORT
+            Value: 8232
+          - Name: ANCHORE_SERVICE_PORT
+            Value: 8232
+        # - Name: ANCHORE_ADMIN_PASSWORD
+        #   Value: 'admin123!'
+        Essential: true
+        MountPoints:
+          - ContainerPath: /analysis_scratch
+            SourceVolume: anchore-scratch
+
+Outputs:
+  JenkinsURL:
+    Description: Jenkins URL
+    Value: !If
+    - HasJenkinsHTTPSCertificate
+    - !Join ['', ['https://jenkins.', !Ref DNSDomain]]
+    - !Join ['', ['http://', !GetAtt JenkinsLoadBalancer.DNSName, '/']]
+  SonarURL:
+    Condition: InstallSonarqubeFlag
+    Description: Sonar URL
+    Value: !If
+    - HasJenkinsHTTPSCertificate
+    - !Join ['', ['https://sonar.', !Ref DNSDomain]]
+    - !Join ['', ['http://', !GetAtt LoadBalancer.DNSName, '/']]
+  AnchoreURL:
+    Condition: InstallAnchoreFlag
+    Description: Sonar URL
+    Value: !Join ['', ['http://', !GetAtt LoadBalancer.DNSName, ':8228/']]

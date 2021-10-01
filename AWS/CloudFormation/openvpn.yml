@@ -1,0 +1,246 @@
+---
+
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: |
+  OpenVPN Access Server 2.6.1 Service Template.
+Parameters:
+  InstanceType:
+    Description: |
+      The OpenVPN EC2 instance type.
+      It is recommend an instance type with support for enhanced networking is selected given the advantage of high throughput and low network latency.
+      See https://aws.amazon.com/ec2/instance-types/ for more information.
+    Type: String
+    Default: "t2.small"
+    AllowedValues: [t2.micro, t2.small, t2.medium, t2.large, t2.xlarge, m3.medium, m3.large, m4.large]    
+  OpenVPNKeyPair:
+    Description: |
+      The OpenVPN Key pair name.
+    Type: AWS::EC2::KeyPair::KeyName
+  VpcId:
+    Description: |
+      The VPC ID.
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Description: |
+      The subnet id of the public subnet.
+    Type: AWS::EC2::Subnet::Id
+  VpcCIDR:
+    Description: | 
+      Please enter the IP range (CIDR notation) for this VPC
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: '((\d{1,3})\.){3}\d{1,3}/\d{1,2}'
+    ConstraintDescription: Must be a valid CIDR 
+  OpenVpnAdminUserPassword:
+    Description: |
+       Initial OpenVPN service admin user password. Please choose a strong password.
+    Type: String
+    NoEcho: true
+  OpenVpnLicenseType:
+      Description: |
+        The OpenVPN License type. See OpenVPN Access Server AMI in the market place for AWS charges/OpenVPN license costs.
+        Options: Bring your own license (BYOL(free 2 user)), 5/10/25/50/100/250/500 connected devices respectively.
+      Type: String
+      Default: "BYOL"
+      AllowedValues:
+        -
+          BYOL
+        -
+          5
+        -
+          10
+        -
+          25
+  Project:
+    Type: String 
+    Description: >
+      Project Name (used for tracking the resources for a project)
+
+  EnvName:
+    Description: |
+      Environment (dev/qa/pp/prod/common)
+    Default: dev
+    Type: String
+    AllowedValues:
+      - dev
+      - qa
+      - pp
+      - prod
+      - common
+
+Mappings:
+  LicenseMap:
+    us-east-1:
+      BYOL: "ami-07a8d85046c8ecc99"
+      '5': "ami-05f7c8c5aa23985f7"
+      '10': "ami-09d5012e24a72e3c9"
+      '25': "ami-0f33e5280c5dfb25c"
+    us-east-2:
+      BYOL: "ami-04f63e8f7a845159a"
+      '5': "ami-0352afdfcf90ad1b5"
+      '10': "ami-02563f0a9b5487e37"
+      '25': "ami-043a5f745f7c740da"
+    us-west-1:
+      BYOL: "ami-0a5aef046a3a6e7bf"
+      '5': "ami-0669df34a909e7210"
+      '10': "ami-0e1ac040c0b850819"
+      '25': "ami-026fcd8c29431981c"
+    us-west-2:
+      BYOL: "ami-0abbb3ceae54aa9fa"
+      '5': "ami-0c49ea39a0cd58a93"
+      '10': "ami-08a333c509505faed"
+      '25': "ami-0054b1cd5abfd397b"
+    ca-central-1:
+      BYOL: "ami-043fe8b5b3cb5b48b"
+      '5': "ami-020942f8ad0f6323f"
+      '10': "ami-0b87c673ad2fd11d2"
+      '25': "ami-06dcdba360d7da02f"
+    eu-central-1:
+      BYOL: "ami-01c85eb1cfa9321e3"
+      '5': "ami-0a2779b9100d8ad76"
+      '10': "ami-05c15237ad9de71f5"
+      '25': "ami-008cfee301c4da88e"
+    eu-west-1:
+      BYOL: "ami-05122e65346f7f721"
+      '5': "ami-0f7812e3f5e463dad"
+      '10': "ami-021086b4727296c63"
+      '25': "ami-0dd681bca6ccb9504"
+    eu-west-2:
+      BYOL: "ami-0bb84df8b7f1eea55"
+      '5': "ami-02d49e3d24a7d78cf"
+      '10': "ami-016b3a2cf008effcf"
+      '25': "ami-04dcde59337f9a616"
+    eu-west-3:
+      BYOL: "ami-088080980c023d570"
+      '5': "ami-074d11b5b29c8d5f7"
+      '10': "ami-0c7013281e36abc5f"
+      '25': "ami-009798e2f9e115093"
+    ap-southeast-1:
+      BYOL: "ami-03e2781e8f0ee0d66"
+      '5': "ami-096d7698c78794469"
+      '10': "ami-07fef633f4fbccde7"
+      '25': "ami-0c09008d552678061"
+    ap-southeast-2:
+      BYOL: "ami-05fdd828e5a7530b0"
+      '5': ami-06ff9849fab62217a
+      '10': "ami-0d8f320eb030374e0"
+      '25': "ami-03871e516b517e089"
+    ap-northeast-1:
+      BYOL: "ami-0481fb75c293f82a8"
+      '5': "ami-07071c9f3d102b442"
+      '10': "ami-033c5807c736b72e7"
+      '25': "ami-0655774bc9d05e101"
+    ap-northeast-2:
+      BYOL: "ami-00ca207ae32c3c9a2"
+      '5': "ami-055143ce789685c6c"
+      '10': "ami-0c686ee1ade227b93"
+      '25': "ami-051180b7791fc169a"
+    ap-south-1:
+      BYOL: "ami-0be23bab5e416bce2"
+      '5': "ami-085d67fbfe42a25e7"
+      '10': "ami-0fab7e94322079123"
+      '25': "ami-07f9b31eb6b0ad5dc"
+    sa-east-1:
+      BYOL: "ami-08bf1c756f487f26a"
+      '5': "ami-0c8761f87bb9a4b36"
+      '10': "ami-0b17057ebb5f5ad9b"
+      '25': "ami-0387687ac2c287cb3"
+
+
+Resources:
+
+  # Request a new Elastic IP Address
+  VpnEIP:
+    Type: "AWS::EC2::EIP"
+    Properties:
+      Domain: vpc
+
+  # Create a security group for the ENI that will be attached to our OpenVPN server
+  # OpenVPN and SSH port access
+  OpenVPNSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the OpenVPN EC2 instance.
+      VpcId:
+        Ref: VpcId
+      SecurityGroupIngress:
+      - ToPort: 443
+        FromPort: 443
+        IpProtocol: tcp
+        CidrIp: "0.0.0.0/0"
+      - ToPort: 22
+        FromPort: 22
+        IpProtocol: tcp
+        CidrIp: !Ref VpcCIDR
+
+  OpenVpnEc2Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: VpnEIP
+    Properties:
+      KeyName:
+        Ref: "OpenVPNKeyPair"
+      BlockDeviceMappings:
+        -
+          DeviceName: "/dev/sda1"
+          Ebs:
+            DeleteOnTermination: true
+            VolumeSize: 8
+      InstanceType:
+        Ref: InstanceType
+      ImageId: !FindInMap [LicenseMap, !Ref "AWS::Region", !Ref OpenVpnLicenseType]
+      NetworkInterfaces:
+        -
+          DeleteOnTermination: true
+          Description: "Primary Network Interface"
+          DeviceIndex: 0
+          AssociatePublicIpAddress: true
+          SubnetId:
+            Ref: SubnetId
+          GroupSet:
+            -
+              Ref: OpenVPNSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          public_hostname=${VpnEIP}
+          admin_user=openvpn
+          admin_pw=${OpenVpnAdminUserPassword}
+          reroute_gw=0
+          reroute_dns=0
+      Tags:
+        -
+          Key: "Name"
+          Value: !Join [ "-", [ !Ref "AWS::StackName", "OpenVPN" ] ]
+        -
+          Key: "Service"
+          Value: "openVPN"
+        -
+          Key: "ServiceComponent"
+          Value: "applicationServer"
+        -
+          Key: "NetworkTier"
+          Value: "public"
+        -
+          Key: "Project"
+          Value: 
+            Ref: Project
+        -
+          Key: "Environment"
+          Value: 
+            Ref: EnvName
+  OpenVPNEipAssociation:
+    Type: "AWS::EC2::EIPAssociation"
+    Properties:
+      EIP:
+        Ref: VpnEIP
+      InstanceId:
+        Ref: OpenVpnEc2Instance
+
+Outputs:
+  OpenVpnManagementConsole:
+    Description: OpenVpn Management Console Access URL
+    Value: !Join ["", [ "https://", !GetAtt OpenVpnEc2Instance.PublicIp, "/admin" ]]
+  OpenVpnLoginUrl:
+      Description: OpenVpn Management User Login URL
+      Value: !Join ["", [ "https://", !GetAtt OpenVpnEc2Instance.PublicIp, "/" ]]
+...

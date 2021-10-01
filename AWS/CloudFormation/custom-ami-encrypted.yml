@@ -1,0 +1,273 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: Create Custom ECS AMI and snapshot Encrypted with the same key
+
+Parameters:
+   Project: 
+    Type: String
+    AllowedPattern : .+
+   KMSAlias: 
+    Type: String
+    AllowedPattern : .+
+   AMIParameterType: 
+    Type: String
+    Default: 'SSM Parameter'
+    AllowedValues:
+    - SSM Parameter
+    - AMIID
+   AMIParameter: 
+    Type: String
+    Default: '/aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id'
+   VolumeTags: 
+    Type: String
+    Default: '{"Key": "custom", "Value": "customValue"}'
+    Description: "list of key value in json format. example : {'Key': 'Environment', 'Value': 'customValue'},{'Key': 'Owner', 'Value': 'customValue'},{'Key': 'Application', 'Value': 'customValue'}"
+   UpdateDate: 
+    Type: String
+    Default: ''
+    
+Resources:
+
+# LambdaExecutionRole - This role must have the IAM privileges to 
+# call the necessary EC2 API calls.  These API calls currently do
+# the following:
+#
+# - use CloudWatch Logs
+# - describe EC2 subnets
+# - describe EC2 VPCs
+  KmsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    Properties:
+      Description: !Sub Created by ${AWS::StackName}
+      EnableKeyRotation: True
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: ami-kms-key
+        Statement:
+        - Sid: Enable IAM User Permissions
+          Effect: Allow
+          Principal:
+            AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+          Action: kms:*
+          Resource: "*"
+        - Sid: Allow use of the key by the default service linked role
+          Effect: Allow
+          Principal:
+            AWS: "*"
+          Action:
+          - kms:Encrypt
+          - kms:Decrypt
+          - kms:ReEncrypt*
+          - kms:GenerateDataKey*
+          - kms:DescribeKey
+          Resource: "*"
+          Condition:
+            StringEquals: 
+              'kms:CallerAccount': !Ref 'AWS::AccountId'
+              'kms:ViaService': !Sub 'ec2.${AWS::Region}.amazonaws.com'
+        - Sid: Allow attachment of persistent resources
+          Effect: Allow
+          Principal:
+             AWS: "*"
+          Action:
+          - kms:CreateGrant
+          Resource: "*"
+          Condition:
+            Bool:
+              kms:GrantIsForAWSResource: true
+            StringEquals: 
+              'kms:CallerAccount': !Ref 'AWS::AccountId'
+              'kms:ViaService': !Sub 'ec2.${AWS::Region}.amazonaws.com'
+  myAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${KMSAlias}"
+      TargetKeyId:
+        Ref: KmsKey
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+          - Effect: Allow
+            Action:
+            - ec2:DescribeSubnets
+            - ec2:DescribeVpcs
+            - ec2:CopyImage
+            - ec2:DescribeImage*
+            - ec2:DescribeAvailabilityZones
+            - ec2:CreateVolume
+            - ec2:CreateSnapshot
+            - ec2:createTags
+            - ec2:DescribeVolume*
+            - ssm:GetParameter
+            - ssm:GetParameters
+            - ssm:PutParameter
+            - kms:Encrypt
+            - kms:Decrypt
+            - kms:ReEncrypt*
+            - kms:GenerateDataKey*
+            - kms:DescribeKey
+            - kms:CreateGrant
+            Resource: "*"
+
+# NOTE: Pay special attention to the indentatiion in the Python code below.
+# Lines that appear blank are likely not blank, but have leading spaces.
+
+  ECSAMIEncriptionLambda:
+    Type: AWS::Lambda::Function
+    Properties: 
+      Description: Look up info from a VPC or subnet ID 
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: "python3.6"
+      Timeout: 900
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import cfnresponse
+          import logging
+          
+          
+          def handler(event, context):
+            logger = logging.getLogger()
+            logger.setLevel(logging.INFO)
+            
+            # initialize our responses, assume failure by default
+            
+            response_data = {}
+            response_status = cfnresponse.FAILED
+            
+            logger.info('Received event: {}'.format(json.dumps(event)))
+            
+            if event['RequestType'] == 'Delete':
+              response_status = cfnresponse.SUCCESS
+              cfnresponse.send(event, context, response_status, response_data)
+            
+            region=event['ResourceProperties']['Region']
+            kmsKeyId=event['ResourceProperties']['KmsKeyId']
+            StackName=event['ResourceProperties']['StackName']
+            AMIParameterType = event['ResourceProperties']['AMIParameterType']
+            AMIParameter = event['ResourceProperties']['AMIParameter']
+            
+            try:
+              ec2=boto3.client('ec2', region)
+              ssm=boto3.client('ssm', region)
+            except Exception as e:
+              logger.info('boto3.client failure: {}'.format(e))
+              cfnresponse.send(event, context, response_status, response_data)
+            
+            try:
+              if AMIParameterType == 'SSM Parameter' :
+                parameter = ssm.get_parameter(Name=AMIParameter)
+                parameterValue = parameter['Parameter']['Value']
+                logger.info('AMI from SSM Parameter output: {}'.format(parameter))
+              else:
+                parameterValue = AMIParameter
+                logger.info('AMIID value: {}'.format(parameterValue))
+              
+              AvailabilityZones = ec2.describe_availability_zones()
+              AvailabilityZone = AvailabilityZones['AvailabilityZones'][0]['ZoneName']
+              print('Availability Zone:', AvailabilityZone)
+              
+              responseAMI = ec2.copy_image(
+                              Description= parameterValue + '-encrypted AMI from stack ' + StackName,
+                              Encrypted=True,
+                              KmsKeyId=kmsKeyId,
+                              Name=parameterValue + '-encrypted',
+                              SourceImageId=parameterValue,
+                              SourceRegion=region)
+              
+              print('response copy_image: ', responseAMI)
+              
+              ec2.get_waiter('image_available').wait(ImageIds=[responseAMI['ImageId']])
+              
+              volumeResponse = ec2.create_volume(
+                                             AvailabilityZone=AvailabilityZone,
+                                             Encrypted=True,
+                                             KmsKeyId=kmsKeyId,
+                                             Size=20,
+                                             VolumeType="gp2",
+                                             TagSpecifications=[
+                                               {
+                                                 'ResourceType': 'volume',
+                                                 'Tags': [
+                                                    {
+                                                      'Key': 'Purpose',
+                                                      'Value': '${Project}'
+                                                    }, ${VolumeTags}
+                                                  ]
+                                               },
+                                             ]
+                                            )
+              print('volumeResponse: ', volumeResponse['VolumeId'])
+              volumeId =volumeResponse['VolumeId']
+              ec2.get_waiter('volume_available').wait(VolumeIds=[volumeId])
+              snapshotResponse = ec2.create_snapshot(VolumeId=volumeId, Description="Snapshot of Encrypted EBS for ECS Custom AMI from stack "+ StackName)
+              print('snapshotResponse: ', snapshotResponse)
+              ec2.create_tags(Resources=[snapshotResponse['SnapshotId']], Tags=[{'Key': 'Project', 'Value': 'csdemo'}])
+              print('snapshotResponse.SnapshotId: ', snapshotResponse['SnapshotId'])
+        
+              response_data['CustomECSAMI'] = responseAMI['ImageId']
+              response_data['VolumeId'] = volumeId
+              response_data['SnapshotId'] = snapshotResponse['SnapshotId']
+              response_status = cfnresponse.SUCCESS
+              cfnresponse.send(event, context, response_status, response_data)
+                
+            except Exception as e:
+              logger.info('failure: {}'.format(e))
+              cfnresponse.send(event, context, response_status, response_data)
+
+  ECSAMIEncription:
+    Type: Custom::ECSAMIEncription
+    Properties:
+      ServiceToken: !GetAtt ECSAMIEncriptionLambda.Arn
+      KmsKeyId: !Ref myAlias
+      Region: !Ref 'AWS::Region'
+      StackName: !Ref 'AWS::StackName'
+      UpdateDate: !Ref UpdateDate
+      AMIParameterType: !Ref AMIParameterType
+      AMIParameter: !Ref AMIParameter
+
+# Outputs - Display function output
+
+Outputs:
+  CustomECSAMI:
+    Description: CustomECSAMI
+    Value: !GetAtt ECSAMIEncription.CustomECSAMI
+    Export:
+      Name: !Sub "${AWS::StackName}-CustomECSAMI"
+  VolumeId:
+    Description: VolumeId
+    Value: !GetAtt ECSAMIEncription.VolumeId
+    Export:
+      Name: !Sub "${AWS::StackName}-VolumeId"
+  SnapshotId:
+    Description: SnapshotId
+    Value: !GetAtt ECSAMIEncription.SnapshotId
+    Export:
+      Name: !Sub "${AWS::StackName}-SnapshotId"

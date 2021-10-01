@@ -1,0 +1,391 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'RDS Postgres'
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+    - Label:
+        default: 'Parent Stacks'
+      Parameters:
+      - VPCStackName
+      - ParentAlertStack
+    - Label:
+        default: 'RDS Parameters'
+      Parameters:
+      - DBInstanceIdentifier
+      - DBSnapshotIdentifier
+      - EngineVersion
+      - DBAllocatedStorage
+      - DBInstanceClass
+      - DBName
+      - DBEncrypted
+      - DBBackupRetentionPeriod
+      - DBMasterUsername
+      - DBMasterUserPassword
+      - DBMultiAZ
+      - PreferredBackupWindow
+      - PreferredMaintenanceWindow
+Parameters:
+  VPCStackName:
+    Description: 'Stack name of parent VPC stack based on vpc/vpc-*azs.yaml template.'
+    Type: String
+  ParentAlertStack:
+    Description: 'Optional but recommended stack name of parent alert stack based on operations/alert.yaml template.'
+    Type: String
+    Default: ''
+  DBInstanceIdentifier:
+    Description: 'DB Instance Identifier'
+    Type: String
+  DBSnapshotIdentifier:
+    Description: 'Optional name or Amazon Resource Name (ARN) of the DB snapshot from which you want to restore (leave blank to create an empty database).'
+    Type: String
+    Default: ''
+  DBAllocatedStorage:
+    Description: 'The allocated storage size, specified in GB (ignored when DBSnapshotIdentifier is set, value used from snapshot).'
+    Type: Number
+    Default: 50
+    MinValue: 5
+    MaxValue: 16384
+  DBInstanceClass:
+    Description: 'The instance type of database server.'
+    Type: String
+    Default: 'db.t3.small'
+  DBName:
+    Description: 'Name of the database (ignored when DBSnapshotIdentifier is set, value used from snapshot).'
+    Type: String
+    Default: 'postgres'
+  DBBackupRetentionPeriod:
+    Description: 'The number of days to keep snapshots of the database.'
+    Type: Number
+    MinValue: 0
+    MaxValue: 35
+    Default: 30
+  DBMasterUsername:
+    Description: 'The master user name for the DB instance (ignored when DBSnapshotIdentifier is set, value used from snapshot).'
+    Type: String
+    Default: postgres
+  DBMasterUserPassword:
+    Description: 'The master password for the DB instance (ignored when DBSnapshotIdentifier is set, value used from snapshot).'
+    Type: String
+    NoEcho: true
+    Default: ''
+  DBMultiAZ:
+    Description: 'Specifies if the database instance is deployed to multiple Availability Zones for HA.'
+    Type: String
+    Default: false
+    AllowedValues: [true, false]
+  DBEncrypted:
+    Description: 'Specifies if the database instance must be encrypted'
+    Type: String
+    Default: true
+    AllowedValues: [true, false]
+  PreferredBackupWindow:
+    Description: 'The daily time range in UTC during which you want to create automated backups.'
+    Type: String
+    Default: '09:54-10:24'
+  PreferredMaintenanceWindow:
+    Description: The weekly time range (in UTC) during which system maintenance can occur.
+    Type: String
+    Default: 'sat:07:00-sat:07:30'
+  EngineVersion:
+    Description: 'PostgreSQL version.'
+    Type: String
+    Default: '11.2'
+    AllowedValues: ['11.2', '11.1', '10.7', '10.6', '10.5', '10.4', '10.3', '10.1', '9.6.12', '9.6.5', '9.5.16', '9.4.21', '9.3.25'] # aws rds describe-db-engine-versions --engine postgres --query "DBEngineVersions[].EngineVersion"
+Conditions:
+  HasKmsKey: !Equals [!Ref DBEncrypted, 'true']
+  HasAlertTopic: !Not [!Equals [!Ref ParentAlertStack, '']]
+  HasDBSnapshotIdentifier: !Not [!Equals [!Ref DBSnapshotIdentifier, '']]
+  HasKmsKeyAndNotDBSnapshotIdentifier: !And [!Condition HasKmsKey, !Not [!Condition HasDBSnapshotIdentifier]]
+
+Resources:
+  KmsKey:
+    Type: AWS::KMS::Key
+    Condition: HasKmsKey
+    Properties:
+      Description: !Sub Created by ${AWS::StackName}
+      EnableKeyRotation: True
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: key-default-1
+        Statement:
+          - Sid: Enable root Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Enable RDS Service Permissions
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+            - 'kms:Encrypt'
+            - 'kms:Decrypt'
+            - 'kms:ReEncrypt*'
+            - 'kms:GenerateDataKey*'
+            - 'kms:CreateGrant'
+            - 'kms:ListGrants'
+            - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:CallerAccount': !Ref 'AWS::AccountId'
+                'kms:ViaService': !Sub 'rds.${AWS::Region}.amazonaws.com'
+          - Sid: Enable SMS Service Permissions
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+            - 'kms:Encrypt'
+            - 'kms:Decrypt'
+            - 'kms:ReEncrypt*'
+            - 'kms:GenerateDataKey*'
+            - 'kms:CreateGrant'
+            - 'kms:ListGrants'
+            - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:CallerAccount': !Ref 'AWS::AccountId'
+                'kms:ViaService': !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
+  KMSKeyAlias:
+      Condition: HasKmsKey
+      Type: AWS::KMS::Alias
+      Properties:
+        AliasName: !Sub alias/${AWS::StackName}-KMSKey
+        TargetKeyId: !Ref KmsKey
+  DatabaseSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: !Ref 'AWS::StackName'
+      VpcId: {'Fn::ImportValue': !Sub '${VPCStackName}-VPCID'}
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 5432
+        ToPort: 5432
+        CidrIp: {'Fn::ImportValue': !Sub '${VPCStackName}-VpcCidrBlock'}
+  DBSubnetGroup:
+    Type: 'AWS::RDS::DBSubnetGroup'
+    Properties:
+      DBSubnetGroupDescription: !Ref 'AWS::StackName'
+      SubnetIds: !Split [',', {'Fn::ImportValue': !Sub '${VPCStackName}-PrivateSubnets'}]
+  DBInstance:
+    DeletionPolicy: Snapshot # default
+    UpdateReplacePolicy: Snapshot
+    Type: 'AWS::RDS::DBInstance'
+    Properties:
+      DBInstanceIdentifier: !Ref DBInstanceIdentifier
+      AllocatedStorage: !If [HasDBSnapshotIdentifier, !Ref 'AWS::NoValue', !Ref DBAllocatedStorage]
+      AllowMajorVersionUpgrade: false
+      AutoMinorVersionUpgrade: true
+      BackupRetentionPeriod: !Ref DBBackupRetentionPeriod
+      CopyTagsToSnapshot: true
+      DBInstanceClass: !Ref DBInstanceClass
+      DBName: !If [HasDBSnapshotIdentifier, !Ref 'AWS::NoValue', !Ref DBName]
+      DBSnapshotIdentifier: !If [HasDBSnapshotIdentifier, !Ref DBSnapshotIdentifier, !Ref 'AWS::NoValue']
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      Engine: postgres
+      EngineVersion: !If [HasDBSnapshotIdentifier, !Ref 'AWS::NoValue', !Ref EngineVersion]
+      KmsKeyId: !If [HasKmsKeyAndNotDBSnapshotIdentifier, !Ref KMSKeyAlias, !Ref 'AWS::NoValue']
+      MasterUsername: !If [HasDBSnapshotIdentifier, !Ref 'AWS::NoValue', !Ref DBMasterUsername]
+      MasterUserPassword: !If [HasDBSnapshotIdentifier, !Ref 'AWS::NoValue', !Ref DBMasterUserPassword]
+      MultiAZ: !Ref DBMultiAZ
+      PreferredBackupWindow: !Ref PreferredBackupWindow
+      PreferredMaintenanceWindow: !Ref PreferredMaintenanceWindow
+      StorageType: gp2
+      StorageEncrypted: !If [HasDBSnapshotIdentifier, !Ref 'AWS::NoValue', !If [HasKmsKey, true, false]]
+      VPCSecurityGroups:
+      - !Ref DatabaseSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}
+  DatabaseBurstBalanceTooLowAlarm:
+    Condition: HasAlertTopic
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmActions:
+      - {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      AlarmDescription: 'Average database storage burst balance over last 10 minutes too low, expect a significant performance drop soon.'
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+      - Name: DBInstanceIdentifier
+        Value: !Ref DBInstance
+      EvaluationPeriods: 1
+      MetricName: BurstBalance
+      Namespace: 'AWS/RDS'
+      OKActions:
+      - {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      Period: 600
+      Statistic: Average
+      Threshold: 20
+  DatabaseCPUUtilizationTooHighAlarm:
+    Condition: HasAlertTopic
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmActions:
+      - {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      AlarmDescription: 'Average database CPU utilization over last 10 minutes too high.'
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+      - Name: DBInstanceIdentifier
+        Value: !Ref DBInstance
+      EvaluationPeriods: 1
+      MetricName: CPUUtilization
+      Namespace: 'AWS/RDS'
+      OKActions:
+      - {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      Period: 600
+      Statistic: Average
+      Threshold: 80
+  DatabaseCPUCreditBalanceTooLowAlarm:
+    Condition: HasAlertTopic
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmActions:
+      - {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      AlarmDescription: 'Average database CPU credit balance over last 10 minutes too low, expect a significant performance drop soon.'
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+      - Name: DBInstanceIdentifier
+        Value: !Ref DBInstance
+      EvaluationPeriods: 1
+      MetricName: CPUCreditBalance
+      Namespace: 'AWS/RDS'
+      OKActions:
+      - {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      Period: 600
+      Statistic: Average
+      Threshold: 20
+  DatabaseDiskQueueDepthTooHighAlarm:
+    Condition: HasAlertTopic
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmActions:
+      - {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      AlarmDescription: 'Average database disk queue depth over last 10 minutes too high, performance may suffer.'
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+      - Name: DBInstanceIdentifier
+        Value: !Ref DBInstance
+      EvaluationPeriods: 1
+      MetricName: DiskQueueDepth
+      Namespace: 'AWS/RDS'
+      OKActions:
+      - {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      Period: 600
+      Statistic: Average
+      Threshold: 64
+  DatabaseFreeableMemoryTooLowAlarm:
+    Condition: HasAlertTopic
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmActions:
+      - {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      AlarmDescription: 'Average database freeable memory over last 10 minutes too low, performance may suffer.'
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+      - Name: DBInstanceIdentifier
+        Value: !Ref DBInstance
+      EvaluationPeriods: 1
+      MetricName: FreeableMemory
+      Namespace: 'AWS/RDS'
+      OKActions:
+      - {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      Period: 600
+      Statistic: Average
+      Threshold: 64000000 # 64 Megabyte in Byte
+  DatabaseFreeStorageSpaceTooLowAlarm:
+    Condition: HasAlertTopic
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmActions:
+      - {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      AlarmDescription: 'Average database free storage space over last 10 minutes too low.'
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+      - Name: DBInstanceIdentifier
+        Value: !Ref DBInstance
+      EvaluationPeriods: 1
+      MetricName: FreeStorageSpace
+      Namespace: 'AWS/RDS'
+      OKActions:
+      - {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      Period: 600
+      Statistic: Average
+      Threshold: 2000000000 # 2 Gigabyte in Byte
+  DatabaseSwapUsageTooHighAlarm:
+    Condition: HasAlertTopic
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmActions:
+      - {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      AlarmDescription: 'Average database swap usage over last 10 minutes too high, performance may suffer.'
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+      - Name: DBInstanceIdentifier
+        Value: !Ref DBInstance
+      EvaluationPeriods: 1
+      MetricName: SwapUsage
+      Namespace: 'AWS/RDS'
+      OKActions:
+      - {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      Period: 600
+      Statistic: Average
+      Threshold: 256000000 # 256 Megabyte in Byte
+  DatabaseEventSubscription:
+    Condition: HasAlertTopic
+    Type: 'AWS::RDS::EventSubscription'
+    Properties:
+      EventCategories:
+      - failover
+      - failure
+      - 'low storage'
+      - maintenance
+      - notification
+      - recovery
+      SnsTopicArn: {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      SourceIds: [!Ref DBInstance]
+      SourceType: 'db-instance'
+  DatabaseCredential:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: !Sub '${AWS::StackName}-DatabaseCredential'
+      Description:  !Sub '${AWS::StackName}-DatabaseCredential secret'
+      SecretString: !Sub '{"username":"${DBMasterUsername}","password":"${DBMasterUserPassword}"}'
+Outputs:
+  DatabasePort:
+    Description: 'The listen port of the database instance.'
+    Value: 5432
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabasePort'
+  StackName:
+    Description: 'Stack name.'
+    Value: !Sub '${AWS::StackName}'
+  InstanceName:
+    Description: 'The name of the database instance.'
+    Value: !Ref DBInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceName'
+  DNSName:
+    Description: 'The connection endpoint for the database.'
+    Value: !GetAtt 'DBInstance.Endpoint.Address'
+    Export:
+      Name: !Sub '${AWS::StackName}-DNSName'
+  DatabaseUsername:
+    Description: 'Database credentials SMS Key'
+    Value: !Join 
+      - ''
+      - - '{{resolve:secretsmanager:'
+        - !Sub '${AWS::StackName}-DatabaseCredential'
+        - ':SecretString:username}}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseUsername'
+  DatabasePassword:
+    Description: 'Database credentials SMS Key'
+    Value: !Join 
+      - ''
+      - - '{{resolve:secretsmanager:'
+        - !Sub '${AWS::StackName}-DatabaseCredential'
+        - ':SecretString:password}}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabasePassword'

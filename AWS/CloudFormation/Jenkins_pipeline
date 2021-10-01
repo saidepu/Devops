@@ -1,0 +1,138 @@
+#!groovy
+@Library(['jenkins-common-lib', 'environments']) _
+
+def appName = "default-common-01"
+def samAppFile = "template.yaml"
+def config
+final String DEV = "dev"
+final String QA = "qa"
+def appVersion = "SNAPSHOT-${BUILD_NUMBER}"
+final String RELEASE = "release"
+final String DEVELOP = "develop"
+def targetEnvName = DEV
+def packageName
+def awsCredential
+def awsRegion
+def majorVersion = "1.0"
+def tags = [
+        "Project=default",
+        "Service=defaultnetwork",
+        "Owner=sor"
+]
+
+/* PipeLine Starts **/
+
+
+pipeline {
+    agent {
+        label "master"
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: "5"))
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('Load Environment') {
+            steps {
+                script {
+                    if (env.BRANCH_NAME == RELEASE) {
+                        targetEnvName = QA
+                    } else {
+                        targetEnvName = DEV
+                    }
+                    config = utils.loadEnvironment(targetEnvName)
+                    if (env.BRANCH_NAME == RELEASE) {
+                        newVersion = utils.getPackageVersion(majorVersion, "$GIT_URL", config.git.credentialId)
+                        appVersion = newVersion.version
+                    }
+                    echo "envConfig : $config"
+                    echo "appVersion : $appVersion"
+                    tags.add("Environment=$targetEnvName")
+                    tags.add("Version=$appVersion")
+                    awsCredential = config.aws.credential
+                    awsRegion = config.aws.region
+                    packageName = "${appName}-${appVersion}"
+                }
+            }
+        }
+
+        stage("Validate") {
+            steps {
+                script {
+                    withAWS(credentials: awsCredential, region: awsRegion) {
+                        cfnValidate(file: samAppFile)
+                    }
+                }
+
+            }
+        }
+
+        stage("Upload snapshot artifact") {
+            steps {
+                script {
+                    if (env.BRANCH_NAME == DEVELOP || env.BRANCH_NAME == RELEASE) {
+                        stage("Push to S3") {
+                            withAWS(credentials: awsCredential, region: awsRegion) {
+                                s3Upload(bucket: config.s3.bucketName, file: samAppFile, path: "${appName}/${majorVersion}/${packageName}/sam-template.yaml")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                script {
+                    // def stackName = "$appName-$targetEnvName"
+                    def stackName = "$config.project-$appName-$targetEnvName"
+                    //def s3SamTemplate = "https://s3.amazonaws.com/${envir.s3.bucketName}/${appName}/${majorVersion}/${packageName}/sam-template.yaml"
+                    def changeSetName = packageName.replace(".", "-")
+                    params = [
+                            "Project": config.project,
+                            "Env"    : targetEnvName,
+                            "Service": appName,
+                            "Owner"  : "sor"
+                    ]
+                    //def tags = cfUtils.getTags(config.project, config.environment, appName, config.owner)
+                    cfDeployPipeline(stackName, changeSetName, samAppFile, params, tags, config)
+                }
+            }
+        }
+
+        stage('tag') {
+            steps {
+                script {
+                    if (env.BRANCH_NAME == RELEASE) {
+                        stage("TAG Source") {
+                            utils.tagGitRepo(".", appVersion, "$GIT_URL", config.git.credentialId)
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('upload release artifact') {
+            steps {
+                script {
+                    if (env.BRANCH_NAME == RELEASE) {
+                        stage("Upload Release") {
+                            withAWS(credentials: awsCredential, region: awsRegion) {
+                                s3Upload(bucket: config.s3.releaseBucketName, file: samAppFile, path: "${appName}/${majorVersion}/${packageName}/sam-template.yaml")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+    }
+
+    post {
+        always {
+            deleteDir()
+        }
+    }
+}

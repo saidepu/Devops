@@ -1,0 +1,454 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Creates a ECS cluster with a shared volume (ESB) 
+Parameters:
+  Project: 
+    Type: String
+    AllowedPattern : .+
+    MinLength: 1
+  Env:
+    Type: String
+    Default: dev
+  Service: 
+    Type: String
+    Default: cicd
+  InstanceType:
+    Type: String
+    Description: EC2 instance type
+    Default: t3.large
+    AllowedValues:
+      - t2.small
+      - t2.medium
+      - t2.large
+      - t3.small
+      - t3.medium
+      - t3.large
+      - m4.large
+      - m4.xlarge
+      - m4.2xlarge
+      - m4.4xlarge
+      - m4.10xlarge
+      - c5.large
+      - c5.xlarge
+      - c5.2xlarge
+    ConstraintDescription: >-
+      must be a general purpose (T2 or M4) EC2 instance type, equal to or larger
+      than a "t2.small".
+  KeyPair:
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    Description: Key pair to log into EC2 instances
+  vpcStackName: 
+    Type: String
+    AllowedPattern: .+
+  ECSAMIEncryptedStackName: 
+    Type: String
+    AllowedPattern : .+
+  EFSFileSystemId: 
+    Type: String
+  DesiredCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 1
+  MaxSize:
+    Type: Number
+    Default: 3
+    MinValue: 1
+  MinSize:
+    Type: Number
+    Default: 1 
+    MinValue: 1 
+Conditions:
+  isEFSInInputIsEmpty:
+    !Equals ["", !Ref EFSFileSystemId]
+Metadata: 
+  AWS::CloudFormation::Interface: 
+    ParameterGroups: 
+      - 
+        Label: 
+          default: "Main Configuration"
+        Parameters: 
+          - Project
+          - Env
+          - Service
+      - 
+        Label: 
+          default: "Network Configuration"
+        Parameters: 
+          - vpcStackName
+      - 
+        Label: 
+          default: "Autoscaling Configuration"
+        Parameters: 
+          - InstanceType
+          - ECSAMIEncryptedStackName
+          - KeyPair
+          - EFSFileSystemId
+          - DesiredCapacity
+          - MinSize
+          - MaxSize
+
+Resources: 
+  ECSAutoScalingGroup:
+    DependsOn: 
+      - EFSMountTarget1
+      - EFSMountTarget2
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT5M
+    Properties:
+      DesiredCapacity: !Ref DesiredCapacity
+      LaunchConfigurationName: !Ref ECSLaunchConfig
+      MaxSize: !Ref MaxSize
+      MinSize: !Ref MinSize
+      VPCZoneIdentifier:
+        - {'Fn::ImportValue': !Sub '${vpcStackName}-PrivateSubnet1ID'}
+        - {'Fn::ImportValue': !Sub '${vpcStackName}-PrivateSubnet2ID'}
+      Tags:
+        - Key: Name
+          Value: !Ref 'AWS::StackName'
+          PropagateAtLaunch: true
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MaxBatchSize: '1'
+        MinInstancesInService: '1'
+        PauseTime: PT5M
+        WaitOnResourceSignals: 'true'
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+  ECSLaunchConfig:
+    Properties:
+      IamInstanceProfile: !Ref ECSInstanceProfile
+      ImageId: {'Fn::ImportValue': !Sub '${ECSAMIEncryptedStackName}-CustomECSAMI'}
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPair
+      SpotPrice: "0.04"
+      SecurityGroups:
+        - !Ref ECSClusterSecurityGroup
+        - !Ref ECSContainerInstancesSecurityGroup
+      BlockDeviceMappings: 
+        - DeviceName: "/dev/xvda"
+          Ebs: 
+            VolumeSize: "100"
+            VolumeType: "gp2"
+      UserData: !Base64 
+        'Fn::Join':
+          - ''
+          - - |
+              #!/bin/bash
+            - |
+              set -ex
+            - |
+              yum install -y aws-cfn-bootstrap
+            - '/opt/aws/bin/cfn-init -v '
+            - '  --stack '
+            - !Ref 'AWS::StackName'
+            - '  --resource ECSLaunchConfig'
+            - '  --region '
+            - !Ref 'AWS::Region'
+            - |+
+
+            - echo ECS_CLUSTER=
+            - !Ref ECSCluster
+            - |2
+               >> /etc/ecs/ecs.config
+            - |
+              mkdir -p /mnt/efs
+            - |
+            - 'echo "'
+            - !If [isEFSInInputIsEmpty, !Ref EFSFileSystem, !Ref EFSFileSystemId]
+            - >
+              :/    /mnt/efs   efs  tls,_netdev"
+              >> /etc/fstab
+            - |
+              mount -a
+            - |
+              mkdir -p /mnt/efs/jenkins_home
+            - |
+              mkdir -p /mnt/efs/sonar_home/conf
+            - |
+              mkdir -p /mnt/efs/sonar_home/data
+            - |
+              mkdir -p /mnt/efs/sonar_home/extensions
+            - |
+              chmod 777 /mnt/efs
+            - |
+              chmod 777 /mnt/efs/jenkins_home
+            - |
+              chmod 777 /mnt/efs/sonar_home/conf
+            - |
+              chmod 777 /mnt/efs/sonar_home/data
+            - |
+              chmod 777 /mnt/efs/sonar_home/extensions
+            - |
+              chmod 777 /var/run/docker.sock
+            - |
+              echo "" >> /etc/ssh/sshd_config
+            - |
+              echo "Ciphers aes128-ctr,aes192-ctr,aes256-ctr,aes128-gcm@openssh.com,aes256-gcm@openssh.com">>/etc/ssh/sshd_config
+            - |
+              service sshd restart              
+            - |
+            - '/opt/aws/bin/cfn-signal -e $? '
+            - '  --stack '
+            - !Ref 'AWS::StackName'
+            - '  --resource ECSAutoScalingGroup'
+            - '  --region '
+            - !Ref 'AWS::Region'
+            - |+
+
+    Metadata:
+      'AWS::CloudFormation::Init':
+        config:
+          packages:
+            yum:
+              nfs-utils: []
+              amazon-efs-utils: []
+    Type: 'AWS::AutoScaling::LaunchConfiguration'
+  ECSClusterSecurityGroup:
+    Properties:
+      VpcId: {'Fn::ImportValue': !Sub '${vpcStackName}-VPCID'}
+      GroupDescription: >-
+        Self-referencing security group to allow all traffic between ECS
+        container instances and ELBs
+    Type: 'AWS::EC2::SecurityGroup'
+  ECSClusterSecurityGroupEgress:
+    Properties:
+      DestinationSecurityGroupId: !Ref ECSClusterSecurityGroup
+      FromPort: '-1'
+      GroupId: !Ref ECSClusterSecurityGroup
+      IpProtocol: '-1'
+      ToPort: '-1'
+    Type: 'AWS::EC2::SecurityGroupEgress'
+  ECSClusterSecurityGroupIngress:
+    Properties:
+      FromPort: '-1'
+      GroupId: !Ref ECSClusterSecurityGroup
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !Ref ECSClusterSecurityGroup
+      ToPort: '-1'
+    Type: 'AWS::EC2::SecurityGroupIngress'
+  ECSContainerInstancesSecurityGroup:
+    Properties:
+      VpcId: {'Fn::ImportValue': !Sub '${vpcStackName}-VPCID'}
+      GroupDescription: Security group for ECS container instances
+      SecurityGroupIngress:
+        - IpProtocol: '-1'
+          FromPort: '-1'
+          ToPort: '-1'
+          CidrIp: {'Fn::ImportValue': !Sub '${vpcStackName}-VpcCidrBlock'}
+    Type: 'AWS::EC2::SecurityGroup'
+  EFSMountTargetSecurityGroup:
+    Properties:
+      VpcId: {'Fn::ImportValue': !Sub '${vpcStackName}-VPCID'}
+      GroupDescription: >-
+        Security group to allow inbound NFS for EFS mount target from ECS
+        container instances
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '2049'
+          ToPort: '2049'
+          SourceSecurityGroupId: !Ref ECSContainerInstancesSecurityGroup
+    Type: 'AWS::EC2::SecurityGroup'
+
+  ECSCluster:
+    Type: 'AWS::ECS::Cluster'
+    Properties:
+      ClusterName: !Join 
+        - '-'
+        - - !Ref AWS::StackName
+          - 'Cluster'
+  EFSFileSystem:
+    Type: 'AWS::EFS::FileSystem'
+    Condition: isEFSInInputIsEmpty
+    DeletionPolicy: Retain
+    Properties:
+      Encrypted: true
+      KmsKeyId: !Ref myAlias
+      FileSystemTags:
+        - Key: Name
+          Value: !Ref ECSCluster
+      PerformanceMode: generalPurpose
+  EFSMountTarget1:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !If [isEFSInInputIsEmpty, !Ref EFSFileSystem, !Ref EFSFileSystemId]
+      SecurityGroups:
+        - !Ref EFSMountTargetSecurityGroup
+      SubnetId: {'Fn::ImportValue': !Sub '${vpcStackName}-PrivateSubnet1ID'}
+  EFSMountTarget2:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !If [isEFSInInputIsEmpty, !Ref EFSFileSystem, !Ref EFSFileSystemId]
+      SecurityGroups:
+        - !Ref EFSMountTargetSecurityGroup
+      SubnetId: {'Fn::ImportValue': !Sub '${vpcStackName}-PrivateSubnet2ID'}
+  ECSInstanceProfile:
+    Properties:
+      Path: /
+      Roles:
+        - !Ref ECSInstanceRole
+    Type: 'AWS::IAM::InstanceProfile'
+  ECSInstanceRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: AmazonEC2ContainerServiceforEC2Role
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecs:CreateCluster'
+                  - 'ecs:DeregisterContainerInstance'
+                  - 'ecs:DiscoverPollEndpoint'
+                  - 'ecs:Poll'
+                  - 'ecs:RegisterContainerInstance'
+                  - 'ecs:StartTelemetrySession'
+                  - 'ecs:Submit*'
+                  - 'ecr:GetAuthorizationToken'
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:BatchGetImage'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+        - PolicyName: AmazonEC2ContainerServiceJenkinsPluginRole
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecs:DescribeContainerInstances'
+                  - 'ecs:ListClusters'
+                  - 'ecs:RegisterTaskDefinition'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'ecs:RunTask'
+                Resource: !Join 
+                  - ''
+                  - - 'arn:aws:ecs:'
+                    - !Ref 'AWS::Region'
+                    - ':'
+                    - !Ref 'AWS::AccountId'
+                    - ':task-definition/jenkins-slave:*'
+              - Effect: Allow
+                Action:
+                  - 'ecs:ListContainerInstances'
+                  - 'ecs:StopTask'
+                Resource: !Join 
+                  - ''
+                  - - 'arn:aws:ecs:'
+                    - !Ref 'AWS::Region'
+                    - ':'
+                    - !Ref 'AWS::AccountId'
+                    - ':cluster/'
+                    - !Ref ECSCluster
+              - Effect: Allow
+                Action:
+                  - 'ecs:StopTask'
+                Resource: !Join 
+                  - ''
+                  - - 'arn:aws:ecs:'
+                    - !Ref 'AWS::Region'
+                    - ':'
+                    - !Ref 'AWS::AccountId'
+                    - ':task/*'
+    Type: 'AWS::IAM::Role'
+  ECSServiceRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs.amazonaws.com
+                - ecs-tasks.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: AmazonEC2ContainerServiceRole
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:AuthorizeSecurityGroupIngress'
+                  - 'ec2:Describe*'
+                  - 'elasticloadbalancing:DeregisterInstancesFromLoadBalancer'
+                  - 'elasticloadbalancing:Describe*'
+                  - 'elasticloadbalancing:RegisterInstancesWithLoadBalancer'
+                  - 'elasticloadbalancing:DeregisterTargets'
+                  - 'elasticloadbalancing:DescribeTargetGroups'
+                  - 'elasticloadbalancing:DescribeTargetHealth'
+                  - 'elasticloadbalancing:RegisterTargets'
+                Resource: '*'
+    Type: 'AWS::IAM::Role'
+  CloudWatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref AWS::StackName
+      RetentionInDays: 365
+  KmsKey:
+    Type: AWS::KMS::Key
+    Condition: isEFSInInputIsEmpty
+    DeletionPolicy: Retain
+    Properties:
+      Description: !Sub Created by ${AWS::StackName}
+      EnableKeyRotation: True
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: ami-kms-key
+        Statement:
+        - Sid: Enable IAM User Permissions
+          Effect: Allow
+          Principal:
+            AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+          Action: kms:*
+          Resource: "*"
+        - Sid: Allow use of the key by the default service linked role
+          Effect: Allow
+          Principal:
+            AWS: "*"
+          Action:
+          - kms:Encrypt
+          - kms:Decrypt
+          - kms:ReEncrypt*
+          - kms:GenerateDataKey*
+          - kms:DescribeKey
+          - kms:CreateGrant
+          - kms:ListAliases 
+          Resource: "*"
+          Condition:
+            StringEquals: 
+              'kms:CallerAccount': !Ref 'AWS::AccountId'
+              'kms:ViaService': !Sub 'elasticfilesystem.${AWS::Region}.amazonaws.com'
+  myAlias:
+    Type: AWS::KMS::Alias
+    Condition: isEFSInInputIsEmpty
+    Properties:
+      AliasName: !Sub "alias/${AWS::StackName}-key"
+      TargetKeyId:
+        Ref: KmsKey
+Outputs:
+  ClusterName:
+    Value: !GetAtt ECSCluster.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ClusterName"
+  ECSServiceRole:
+    Value: !GetAtt ECSServiceRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ECSServiceRole"
+  CloudWatchLogsGroup:
+    Value: !Ref  CloudWatchLogsGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudWatchLogsGroup"
+  ECSClusterSecurityGroup:
+    Value: !Ref  ECSClusterSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-ECSClusterSecurityGroup"

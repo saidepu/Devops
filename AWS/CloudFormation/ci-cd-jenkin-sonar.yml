@@ -1,0 +1,522 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Creates a ECS cluster with a shared volume (ESB) an Aurora RDS
+  view Jenkins externally)
+Parameters:
+  Project: 
+    Type: String
+    AllowedPattern : .+
+    MinLength: 1
+  Env:
+    Type: String
+    Default: dev
+  Service: 
+    Type: String
+    Default: cicd
+  KMSAlias: 
+    Type: String
+    AllowedPattern : .+
+  InstanceType:
+    Type: String
+    Description: EC2 instance type
+    Default: t3.medium
+    AllowedValues:
+      - t2.small
+      - t2.medium
+      - t2.large
+      - t3.small
+      - t3.medium
+      - t3.large
+      - m4.large
+      - m4.xlarge
+      - m4.2xlarge
+      - m4.4xlarge
+      - m4.10xlarge
+    ConstraintDescription: >-
+      must be a general purpose (T2 or M4) EC2 instance type, equal to or larger
+      than a "t2.small".
+  KeyPair:
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    Description: Key pair to log into EC2 instances
+  SonarDBRequired:
+    Type: String
+    Description: Install Sonar DB
+    Default: Y
+    AllowedValues:
+      - Y
+      - N
+  SonarDBUsername: 
+    Type: String
+    Description: Username for Sonar Database
+    Default: sonar
+  SonarDBPassword: 
+    Type: String
+    Description: Password for Sonar Database
+    NoEcho: true
+    AllowedPattern: ^[^@\/"]*$
+  ConfirmSonarDBPassword: 
+    Type: String
+    Description: confirm Password for Sonar Database
+    NoEcho: true
+    AllowedPattern: ^[^@\/"]*$
+  vpcStackName: 
+    Type: String
+    AllowedPattern: .+
+  ECSAMIEncryptedStackName: 
+    Type: String
+    AllowedPattern : .+
+  EFSFileSystemId: 
+    Type: String
+Rules:
+  matchPasswords:
+    Assertions:
+      - Assert:
+          Fn::Equals:
+            - Ref: 'SonarDBPassword'
+            - Ref: 'ConfirmSonarDBPassword'
+        AssertDescription: 'Passwords match'
+Conditions:
+  isEFSInInputIsEmpty:
+    !Equals ["", !Ref EFSFileSystemId]
+  isSonarDBRequired:
+    !Equals ["Y", !Ref SonarDBRequired]
+Metadata: 
+  AWS::CloudFormation::Interface: 
+    ParameterGroups: 
+      - 
+        Label: 
+          default: "Main Configuration"
+        Parameters: 
+          - Project
+          - Env
+          - Service
+      - 
+        Label: 
+          default: "Network Configuration"
+        Parameters: 
+          - vpcStackName
+      - 
+        Label: 
+          default: "EC2 Configuration"
+        Parameters: 
+          - InstanceType
+          - KMSAlias
+          - ECSAMIEncryptedStackName
+          - KeyPair
+          - EFSFileSystemId
+      - 
+        Label: 
+          default: "Sonar Database Configuration"
+        Parameters:
+          - SonarDBRequired
+          - SonarDBUsername 
+          - SonarDBPassword
+          - ConfirmSonarDBPassword
+    ParameterLabels: 
+      ConfirmSonarDBPassword: 
+        default: "Confirm SonarDBPassword"
+Resources: 
+  ECSAutoScalingGroup:
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT5M
+    Properties:
+      DesiredCapacity: 2
+      LaunchConfigurationName: !Ref ECSLaunchConfig
+      MaxSize: 2
+      MinSize: 2
+      VPCZoneIdentifier:
+        - {'Fn::ImportValue': !Sub '${vpcStackName}-PrivateSubnet1ID'}
+        - {'Fn::ImportValue': !Sub '${vpcStackName}-PrivateSubnet2ID'}
+      Tags:
+        - Key: Name
+          Value: !Ref 'AWS::StackName'
+          PropagateAtLaunch: true
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MaxBatchSize: '1'
+        MinInstancesInService: '1'
+        PauseTime: PT5M
+        WaitOnResourceSignals: 'true'
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+  ECSLaunchConfig:
+    Properties:
+      IamInstanceProfile: !Ref ECSInstanceProfile
+      ImageId: {'Fn::ImportValue': !Sub '${ECSAMIEncryptedStackName}-CustomECSAMI'}
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPair
+      SecurityGroups:
+        - !Ref ECSClusterSecurityGroup
+        - !Ref ECSContainerInstancesSecurityGroup
+      BlockDeviceMappings: 
+        - DeviceName: "/dev/xvda"
+          Ebs: 
+            VolumeSize: "50"
+            VolumeType: "gp2"
+        - DeviceName: "/dev/xvdcz"
+          Ebs: 
+            VolumeSize: "100"
+            VolumeType: "gp2"
+            SnapshotId: {'Fn::ImportValue': !Sub '${ECSAMIEncryptedStackName}-SnapshotId'}
+      UserData: !Base64 
+        'Fn::Join':
+          - ''
+          - - |
+              #!/bin/bash
+            - |
+              set -ex
+            - |
+              yum install -y aws-cfn-bootstrap
+            - '/opt/aws/bin/cfn-init -v '
+            - '  --stack '
+            - !Ref 'AWS::StackName'
+            - '  --resource ECSLaunchConfig'
+            - '  --region '
+            - !Ref 'AWS::Region'
+            - |+
+
+            - echo ECS_CLUSTER=
+            - !Ref ECSCluster
+            - |2
+               >> /etc/ecs/ecs.config
+            - |
+              mkdir -p /mnt/efs
+            - |
+              aws_region="${aws_az:0:${#aws_az}-1}"
+            - 'echo "'
+            - !If [isEFSInInputIsEmpty, !Ref EFSFileSystem, !Ref EFSFileSystemId]
+            - >
+              .efs.${aws_region}.amazonaws.com:/    /mnt/efs   efs  tls,_netdev"
+              >> /etc/fstab
+            - |
+              mount -a
+            - |
+              mkdir -p /mnt/efs/jenkins_home
+            - |
+              mkdir -p /mnt/efs/sonar_home/conf
+            - |
+              mkdir -p /mnt/efs/sonar_home/data
+            - |
+              mkdir -p /mnt/efs/sonar_home/extensions
+            - |
+              chmod 777 /mnt/efs
+            - |
+              chmod 777 /mnt/efs/jenkins_home
+            - |
+              chmod 777 /mnt/efs/sonar_home/conf
+            - |
+              chmod 777 /mnt/efs/sonar_home/data
+            - |
+              chmod 777 /mnt/efs/sonar_home/extensions
+            - |
+              service docker restart
+            - |
+              start ecs
+            - |
+              chmod -R 777 /var/run/docker.sock
+            - |
+            - '/opt/aws/bin/cfn-signal -e $? '
+            - '  --stack '
+            - !Ref 'AWS::StackName'
+            - '  --resource ECSAutoScalingGroup'
+            - '  --region '
+            - !Ref 'AWS::Region'
+            - |+
+
+    Metadata:
+      'AWS::CloudFormation::Init':
+        config:
+          packages:
+            yum:
+              nfs-utils: []
+              amazon-efs-utils: []
+    Type: 'AWS::AutoScaling::LaunchConfiguration'
+  ECSClusterSecurityGroup:
+    Properties:
+      VpcId: {'Fn::ImportValue': !Sub '${vpcStackName}-VPCID'}
+      GroupDescription: >-
+        Self-referencing security group to allow all traffic between ECS
+        container instances and ELBs
+    Type: 'AWS::EC2::SecurityGroup'
+  ECSClusterSecurityGroupEgress:
+    Properties:
+      DestinationSecurityGroupId: !Ref ECSClusterSecurityGroup
+      FromPort: '-1'
+      GroupId: !Ref ECSClusterSecurityGroup
+      IpProtocol: '-1'
+      ToPort: '-1'
+    Type: 'AWS::EC2::SecurityGroupEgress'
+  ECSClusterSecurityGroupIngress:
+    Properties:
+      FromPort: '-1'
+      GroupId: !Ref ECSClusterSecurityGroup
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !Ref ECSClusterSecurityGroup
+      ToPort: '-1'
+    Type: 'AWS::EC2::SecurityGroupIngress'
+  ECSContainerInstancesSecurityGroup:
+    Properties:
+      VpcId: {'Fn::ImportValue': !Sub '${vpcStackName}-VPCID'}
+      GroupDescription: Security group for ECS container instances
+      SecurityGroupIngress:
+        - IpProtocol: '-1'
+          FromPort: '-1'
+          ToPort: '-1'
+          CidrIp: {'Fn::ImportValue': !Sub '${vpcStackName}-VpcCidrBlock'}
+    Type: 'AWS::EC2::SecurityGroup'
+  EFSMountTargetSecurityGroup:
+    Properties:
+      VpcId: {'Fn::ImportValue': !Sub '${vpcStackName}-VPCID'}
+      GroupDescription: >-
+        Security group to allow inbound NFS for EFS mount target from ECS
+        container instances
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '2049'
+          ToPort: '2049'
+          SourceSecurityGroupId: !Ref ECSContainerInstancesSecurityGroup
+    Type: 'AWS::EC2::SecurityGroup'
+  RDSSonarDBSubnetGroup: 
+    Type: "AWS::RDS::DBSubnetGroup"
+    Condition: isSonarDBRequired
+    Properties: 
+      DBSubnetGroupDescription: "subnet group for sonardb"
+      SubnetIds: 
+        - {'Fn::ImportValue': !Sub '${vpcStackName}-PrivateSubnet1ID'}
+        - {'Fn::ImportValue': !Sub '${vpcStackName}-PrivateSubnet2ID'}
+  RDSSonarDB:
+    Type: AWS::RDS::DBCluster
+    Condition: isSonarDBRequired
+    Properties:
+      MasterUsername: !Ref SonarDBUsername
+      MasterUserPassword: !Ref SonarDBPassword
+      DatabaseName: 'sonar'
+      Engine: aurora
+      EngineMode: serverless
+      ScalingConfiguration:
+        AutoPause: true
+        MaxCapacity: 4
+        MinCapacity: 2
+        SecondsUntilAutoPause: 300
+      DBSubnetGroupName:
+        Ref: RDSSonarDBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref ECSClusterSecurityGroup	
+  ECSCluster:
+    Type: 'AWS::ECS::Cluster'
+    Properties:
+      ClusterName: !Join 
+        - '-'
+        - - !Ref AWS::StackName
+          - 'Cluster'
+  EFSFileSystem:
+    Type: 'AWS::EFS::FileSystem'
+    Condition: isEFSInInputIsEmpty
+    DeletionPolicy: Retain
+    Properties:
+      Encrypted: true
+      KmsKeyId: !Ref myAlias
+      FileSystemTags:
+        - Key: Name
+          Value: !Ref ECSCluster
+      PerformanceMode: generalPurpose
+  EFSMountTarget1:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !If [isEFSInInputIsEmpty, !Ref EFSFileSystem, !Ref EFSFileSystemId]
+      SecurityGroups:
+        - !Ref EFSMountTargetSecurityGroup
+      SubnetId: {'Fn::ImportValue': !Sub '${vpcStackName}-PrivateSubnet1ID'}
+  EFSMountTarget2:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !If [isEFSInInputIsEmpty, !Ref EFSFileSystem, !Ref EFSFileSystemId]
+      SecurityGroups:
+        - !Ref EFSMountTargetSecurityGroup
+      SubnetId: {'Fn::ImportValue': !Sub '${vpcStackName}-PrivateSubnet2ID'}
+  ECSInstanceProfile:
+    Properties:
+      Path: /
+      Roles:
+        - !Ref ECSInstanceRole
+    Type: 'AWS::IAM::InstanceProfile'
+  ECSInstanceRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: AmazonEC2ContainerServiceforEC2Role
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecs:CreateCluster'
+                  - 'ecs:DeregisterContainerInstance'
+                  - 'ecs:DiscoverPollEndpoint'
+                  - 'ecs:Poll'
+                  - 'ecs:RegisterContainerInstance'
+                  - 'ecs:StartTelemetrySession'
+                  - 'ecs:Submit*'
+                  - 'ecr:GetAuthorizationToken'
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:BatchGetImage'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+        - PolicyName: AmazonEC2ContainerServiceJenkinsPluginRole
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecs:DescribeContainerInstances'
+                  - 'ecs:ListClusters'
+                  - 'ecs:RegisterTaskDefinition'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'ecs:RunTask'
+                Resource: !Join 
+                  - ''
+                  - - 'arn:aws:ecs:'
+                    - !Ref 'AWS::Region'
+                    - ':'
+                    - !Ref 'AWS::AccountId'
+                    - ':task-definition/jenkins-slave:*'
+              - Effect: Allow
+                Action:
+                  - 'ecs:ListContainerInstances'
+                  - 'ecs:StopTask'
+                Resource: !Join 
+                  - ''
+                  - - 'arn:aws:ecs:'
+                    - !Ref 'AWS::Region'
+                    - ':'
+                    - !Ref 'AWS::AccountId'
+                    - ':cluster/'
+                    - !Ref ECSCluster
+              - Effect: Allow
+                Action:
+                  - 'ecs:StopTask'
+                Resource: !Join 
+                  - ''
+                  - - 'arn:aws:ecs:'
+                    - !Ref 'AWS::Region'
+                    - ':'
+                    - !Ref 'AWS::AccountId'
+                    - ':task/*'
+    Type: 'AWS::IAM::Role'
+  ECSServiceRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs.amazonaws.com
+                - ecs-tasks.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: AmazonEC2ContainerServiceRole
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:AuthorizeSecurityGroupIngress'
+                  - 'ec2:Describe*'
+                  - 'elasticloadbalancing:DeregisterInstancesFromLoadBalancer'
+                  - 'elasticloadbalancing:Describe*'
+                  - 'elasticloadbalancing:RegisterInstancesWithLoadBalancer'
+                  - 'elasticloadbalancing:DeregisterTargets'
+                  - 'elasticloadbalancing:DescribeTargetGroups'
+                  - 'elasticloadbalancing:DescribeTargetHealth'
+                  - 'elasticloadbalancing:RegisterTargets'
+                Resource: '*'
+    Type: 'AWS::IAM::Role'
+  CloudWatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref AWS::StackName
+      RetentionInDays: 365
+  KmsKey:
+    Type: AWS::KMS::Key
+    Condition: isEFSInInputIsEmpty
+    DeletionPolicy: Retain
+    Properties:
+      Description: !Sub Created by ${AWS::StackName}
+      EnableKeyRotation: True
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: ami-kms-key
+        Statement:
+        - Sid: Enable IAM User Permissions
+          Effect: Allow
+          Principal:
+            AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+          Action: kms:*
+          Resource: "*"
+        - Sid: Allow use of the key by the default service linked role
+          Effect: Allow
+          Principal:
+            AWS: "*"
+          Action:
+          - kms:Encrypt
+          - kms:Decrypt
+          - kms:ReEncrypt*
+          - kms:GenerateDataKey*
+          - kms:DescribeKey
+          - kms:CreateGrant
+          - kms:ListAliases 
+          Resource: "*"
+          Condition:
+            StringEquals: 
+              'kms:CallerAccount': !Ref 'AWS::AccountId'
+              'kms:ViaService': !Sub 'elasticfilesystem.${AWS::Region}.amazonaws.com'
+  myAlias:
+    Type: AWS::KMS::Alias
+    Condition: isEFSInInputIsEmpty
+    Properties:
+      AliasName: !Sub "alias/${KMSAlias}"
+      TargetKeyId:
+        Ref: KmsKey
+Outputs:
+  ClusterName:
+    Value: !GetAtt ECSCluster.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ClusterName"
+  SonarDBEndpoint:
+    Condition: isSonarDBRequired
+    Value: !GetAtt RDSSonarDB.Endpoint.Address
+    Export:
+      Name: !Sub "${AWS::StackName}-SonarDBEndpoint"
+  SonarDBUsername:
+    Condition: isSonarDBRequired
+    Value: !Ref SonarDBUsername
+    Export:
+      Name: !Sub "${AWS::StackName}-SonarDBUsername"
+  SonarDBPassword:
+    Condition: isSonarDBRequired
+    Value: !Ref SonarDBPassword
+    Export:
+      Name: !Sub "${AWS::StackName}-SonarDBPassword"
+  ECSServiceRole:
+    Value: !GetAtt ECSServiceRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ECSServiceRole"
+  CloudWatchLogsGroup:
+    Value: !Ref  CloudWatchLogsGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudWatchLogsGroup"
+  ECSClusterSecurityGroup:
+    Value: !Ref  ECSClusterSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-ECSClusterSecurityGroup"

@@ -1,0 +1,93 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  This template will create the pre-requisites for deploying SAM applicaiton.
+Parameters:
+  Project:
+    Description: Project Name
+    Type: String
+    Default: default
+  Env:
+    Description: Name of the enviornment
+    Type: String
+    Default: dev
+  Service:
+    Description: Name of the service
+    Type: String
+    Default: homenetwork
+  S3Bucket:
+    Type: String
+    Default: default-sam-bucket
+  S3CodePackage:
+    Type: String
+    Default: code/defaulviewapi.zip	
+Resources:
+  DynamoDB:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: !Join
+        - '-'
+        - - Fn::Sub: ${Env}
+          - Fn::Sub: ${AWS::Region}
+          - Fn::Sub: ${Service}
+      PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: true
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: crmAccountId
+          AttributeType: S  
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S 
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+      - IndexName: crmAccountId-index
+        KeySchema:
+        - AttributeName: crmAccountId
+          KeyType: HASH
+        Projection:
+          ProjectionType: ALL
+      Tags:
+        - 
+          Key: owner
+          Value: sor
+        - 
+          Key: workflow
+          Value: common
+        -
+          Key: enviornment
+          Value: !Join
+            - '-'
+            - - Fn::Sub: ${Env}
+        -
+          Key: service
+          Value: !Join
+            - '-'
+            - - Fn::Sub: ${Service}
+        -
+          Key: application-role
+          Value: db
+        -
+          Key: Name
+          Value: !Join
+            - '-'
+            - - Fn::Sub: ${Env}
+              - Fn::Sub: ${AWS::Region}
+              - Fn::Sub: ${Service}
+        -
+          Key: repo
+          Value: infra-01
+        -
+          Key: project
+          Value: default
+Outputs:
+  DynamoDB:
+    Description: DynamoDB job Table
+    Value: !Ref DynamoDB
+    Export:
+       Name: !Sub "${AWS::StackName}-DynamoDB"
